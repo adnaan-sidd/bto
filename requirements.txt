@@ -1,0 +1,8 @@
+yahooquery
+ccxt
+pandas
+ta
+MetaTrader5
+pandas 
+matplotlib
+openpyxl
