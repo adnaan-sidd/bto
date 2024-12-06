@@ -1,0 +1,22 @@
+# config.yaml
+trading_parameters:
+  symbol: "EURUSD"
+  timeframe: "M15"
+  initial_lot: 0.1
+  sl_pips: 10         # Stop-loss in pips
+  tp_pips: 30         # Take-profit in pips
+  lot_multiplier: 1.7 # Lot size multiplier after SL
+  max_sl_streak: 7    # Max SL streak before reset
+  rsi_period: 14      # RSI calculation period
+  rsi_buy: 35         # Buy if RSI <= 35
+  rsi_sell: 70        # Sell if RSI >= 70
+
+mt5_connection:
+  server: "Exness-MT5Trial8"
+  login: " 79486275"
+  password: "26122001As@"
+
+backtest_parameters:
+  start_date: "2023-08-01"
+  end_date: "2023-12-01"
+  data_path: "data/EURUSD_M15.csv"
