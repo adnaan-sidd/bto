@@ -2,10 +2,15 @@
 //|                    EURUSD RSI Martingale Trading Strategy        |
 //+------------------------------------------------------------------+
 #property strict
+#property indicator_chart_window
 #property indicator_separate_window
+#property indicator_minimum 0
+#property indicator_maximum 100
+#property indicator_level1 30
+#property indicator_level2 70
+#property indicator_levelcolor clrSilver
 
 #include <Trade\Trade.mqh>
-#include <MovingAverages.mqh>
 
 // Enhanced Logging Function
 void DebugLog(string message, bool isImportant = false) {
@@ -15,57 +20,44 @@ void DebugLog(string message, bool isImportant = false) {
 
 // Strategy Configuration
 input string InpStrategyName = "EURUSD_RSI_Martingale_Strategy";
-input string InpInputSymbol = "EURUSD"; // Trading Symbol
-input ENUM_TIMEFRAMES InpChartTimeframe = PERIOD_M15; // 15-Minute Timeframe
+input string InpInputSymbol = "EURUSD";
+input ENUM_TIMEFRAMES InpChartTimeframe = PERIOD_M1;
+input ENUM_APPLIED_PRICE InpRsiAppliedPrice = PRICE_CLOSE;
 
 // Trading Parameters
-input double InpInitialVolume = 0.01; // Initial Volume (equivalent to Lot Size)
-input int InpTakeProfitPips = 30; // Take Profit in Pips
-input int InpStopLossPips = 10; // Stop Loss in Pips
-input int InpRsiPeriod = 14; // RSI Period
-input double InpRsiBuyThreshold = 35.0; // Buy Threshold (below 35)
-input double InpRsiSellThreshold = 75.0; // Sell Threshold (above 75)
+input double InpInitialVolume = 0.10;
+input int InpTakeProfitPips = 30;
+input int InpStopLossPips = 10;
+input int InpRsiPeriod = 14;
+input double InpRsiBuyThreshold = 35.0;
+input double InpRsiSellThreshold = 75.0;
+input int InpMaxLossStreak = 7;
+input double InpVolumeMultiplier = 2.0;
+input double InpMaxAllowedVolume = 10.0; // Maximum allowed trade volume
 
-// Risk Management Inputs
-input int InpMaxLossStreak = 7; // Max Stop Loss Hit Streak
-input double InpVolumeMultiplier = 2.0; // Volume Multiplier on Losing Streak
-
-// Global Strategy Class
+// Global Variables
 class CRSIBacktestStrategy {
 private:
     CTrade trade;
-    double currentVolume;
-    int lossStreak;
+    double currentBuyVolume;
+    double currentSellVolume;
+    int buyLossStreak;
+    int sellLossStreak;
     bool isTrading;
-    datetime lastTradeTime;
-    bool activeTradeExists;
-    bool isActiveTradeBuy;
-
-    // Flags to track first buy and sell trades
-    bool firstBuyTradeExecuted;
-    bool firstSellTradeExecuted;
-
-    int rsiHandle;  // RSI indicator handle
+    int rsiHandle;
     double rsiBuffer[];
+    bool rsiBuyMet;
+    bool rsiSellMet;
 
     // Validate Trade Volume
     bool ValidateTradeVolume(double& volume) {
         double minVolume = SymbolInfoDouble(InpInputSymbol, SYMBOL_VOLUME_MIN);
-        double maxVolume = SymbolInfoDouble(InpInputSymbol, SYMBOL_VOLUME_MAX);
+        double maxVolume = MathMin(SymbolInfoDouble(InpInputSymbol, SYMBOL_VOLUME_MAX), InpMaxAllowedVolume);
         double volumeStep = SymbolInfoDouble(InpInputSymbol, SYMBOL_VOLUME_STEP);
 
         volume = MathMax(minVolume, volume);
+        volume = MathMin(volume, maxVolume); // Ensure volume does not exceed max allowed volume
         volume = NormalizeDouble(MathRound(volume / volumeStep) * volumeStep, 2);
-
-        if (volume < minVolume) {
-            volume = minVolume;
-            DebugLog("Adjusted volume to minimum: " + DoubleToString(volume, 4), true);
-        }
-
-        if (volume > maxVolume) {
-            volume = maxVolume;
-            DebugLog("Adjusted volume to maximum: " + DoubleToString(volume, 4), true);
-        }
 
         if (volume < minVolume || volume > maxVolume) {
             DebugLog("CRITICAL: Volume validation failed. Volume: " + DoubleToString(volume, 4), true);
@@ -75,7 +67,7 @@ private:
         return true;
     }
 
-    // Calculate Trade Parameters
+    // Calculate Trade Levels
     void CalculateTradeLevels(bool isBuy, double& stopLoss, double& takeProfit) {
         double bid = SymbolInfoDouble(InpInputSymbol, SYMBOL_BID);
         double ask = SymbolInfoDouble(InpInputSymbol, SYMBOL_ASK);
@@ -90,55 +82,75 @@ private:
         }
     }
 
-    // Update Performance Metrics
-    void UpdatePerformanceMetrics(double profit, bool isTradeClosed) {
-        if (isTradeClosed) {
-            if (profit > 0) {
-                currentVolume = InpInitialVolume; // Reset volume after TP
-                lossStreak = 0; // Reset loss streak
-            } else {
-                lossStreak++;
-                currentVolume *= InpVolumeMultiplier; // Multiply volume on SL hit
-            }
+    // Get Current RSI Value
+    double GetCurrentRSI() {
+        double rsi[];
+        ArraySetAsSeries(rsi, true);
+        int copied = CopyBuffer(rsiHandle, 0, 0, 1, rsi);
+        return (copied > 0) ? rsi[0] : 0;
+    }
 
-            if (lossStreak >= InpMaxLossStreak) {
-                isTrading = false; // Stop trading after 7 consecutive losses
-                DebugLog("TRADING STOPPED: Max loss streak reached", true);
-            }
+    // Check Last Trade Result
+    void CheckLastTradeResult(bool isBuy) {
+        ulong ticket = trade.ResultOrder();
+        if (ticket > 0) {
+            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double exitPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+            double stopLoss = PositionGetDouble(POSITION_SL);
+            double takeProfit = PositionGetDouble(POSITION_TP);
 
-            activeTradeExists = false;
+            if ((isBuy && exitPrice >= takeProfit) || (!isBuy && exitPrice <= takeProfit)) {
+                // Take Profit hit
+                if (isBuy) {
+                    buyLossStreak = 0;
+                } else {
+                    sellLossStreak = 0;
+                }
+            } else if ((isBuy && exitPrice <= stopLoss) || (!isBuy && exitPrice >= stopLoss)) {
+                // Stop Loss hit
+                if (isBuy) {
+                    buyLossStreak++;
+                } else {
+                    sellLossStreak++;
+                }
+            }
         }
     }
 
 public:
-    // Constructor
     CRSIBacktestStrategy() {
-        currentVolume = InpInitialVolume;
-        lossStreak = 0;
+        currentBuyVolume = InpInitialVolume;
+        currentSellVolume = InpInitialVolume;
+        buyLossStreak = 0;
+        sellLossStreak = 0;
         isTrading = true;
-        activeTradeExists = false;
-        firstBuyTradeExecuted = false;
-        firstSellTradeExecuted = false;
+        rsiHandle = INVALID_HANDLE;
+        rsiBuyMet = false;
+        rsiSellMet = false;
     }
 
-    // Release resources
-    void CleanUp() {
-        if (rsiHandle != INVALID_HANDLE) {
-            IndicatorRelease(rsiHandle);
+    // Initialize RSI Indicator
+    bool Init() {
+        rsiHandle = iRSI(InpInputSymbol, InpChartTimeframe, InpRsiPeriod, InpRsiAppliedPrice);
+        if (rsiHandle == INVALID_HANDLE) {
+            DebugLog("RSI Indicator Initialization Failed", true);
+            return false;
         }
+        ArraySetAsSeries(rsiBuffer, true);
+        return true;
     }
 
-    // Execute Trade
+    // Execute Trade with Advanced Checks
     bool ExecuteTrade(bool isBuy) {
         if (!isTrading) {
-            DebugLog("Trading is stopped due to 7 consecutive SL hits.", true);
+            DebugLog("Trading is stopped due to max loss streak.", true);
             return false;
         }
 
         double stopLoss, takeProfit;
         CalculateTradeLevels(isBuy, stopLoss, takeProfit);
 
-        double tradeVolume = currentVolume;
+        double tradeVolume = isBuy ? currentBuyVolume : currentSellVolume;
         if (!ValidateTradeVolume(tradeVolume)) {
             DebugLog("Invalid trade volume. Trade canceled.", true);
             return false;
@@ -149,13 +161,11 @@ public:
             trade.Sell(tradeVolume, InpInputSymbol, 0, stopLoss, takeProfit, InpStrategyName);
 
         if (tradeResult) {
-            lastTradeTime = TimeCurrent();
-            activeTradeExists = true;
-            isActiveTradeBuy = isBuy;
             DebugLog(isBuy ? "BUY TRADE EXECUTED" : "SELL TRADE EXECUTED", true);
             DebugLog("Trade Details: Volume=" + DoubleToString(tradeVolume, 2) + 
                      ", SL=" + DoubleToString(stopLoss, _Digits) + 
                      ", TP=" + DoubleToString(takeProfit, _Digits), false);
+            CheckLastTradeResult(isBuy);
             return true;
         } else {
             DebugLog("TRADE EXECUTION FAILED: " + trade.ResultRetcodeDescription(), true);
@@ -163,78 +173,65 @@ public:
         }
     }
 
-    // Check Position Status and Update Metrics
-    void CheckPositionStatus() {
-        if (!activeTradeExists) return;
+    // Check and Update Trade Metrics
+    void CheckTradeConditions() {
+        if (PositionsTotal() > 0) return;
 
-        bool positionClosed = false;
-        double profit = 0;
+        double currentRSI = GetCurrentRSI();
 
-        if (!PositionSelect(InpInputSymbol)) {
-            positionClosed = true;
-            profit = (isActiveTradeBuy) ? 
-                (SymbolInfoDouble(InpInputSymbol, SYMBOL_BID) - PositionGetDouble(POSITION_PRICE_OPEN)) :
-                (PositionGetDouble(POSITION_PRICE_OPEN) - SymbolInfoDouble(InpInputSymbol, SYMBOL_ASK));
-            profit *= currentVolume * SymbolInfoDouble(InpInputSymbol, SYMBOL_TRADE_CONTRACT_SIZE);
-            UpdatePerformanceMetrics(profit, positionClosed);
+        // Buy Condition
+        if (currentRSI < InpRsiBuyThreshold || rsiBuyMet) {
+            rsiBuyMet = true;
+            if (buyLossStreak < InpMaxLossStreak) {
+                if (ExecuteTrade(true)) {
+                    currentBuyVolume *= InpVolumeMultiplier;
+                }
+            } else {
+                isTrading = false;
+                DebugLog("BUY TRADING STOPPED - Max Loss Streak Reached", true);
+            }
+        }
 
-            // Place a new trade in the same direction with updated volume
-            ExecuteTrade(isActiveTradeBuy);
+        // Sell Condition
+        if (currentRSI > InpRsiSellThreshold || rsiSellMet) {
+            rsiSellMet = true;
+            if (sellLossStreak < InpMaxLossStreak) {
+                if (ExecuteTrade(false)) {
+                    currentSellVolume *= InpVolumeMultiplier;
+                }
+            } else {
+                isTrading = false;
+                DebugLog("SELL TRADING STOPPED - Max Loss Streak Reached", true);
+            }
         }
     }
 
-    // Check for Trade Opportunity based on RSI and conditions
-    void CheckTradeOpportunity() {
-        if (lossStreak >= InpMaxLossStreak) {
-            isTrading = false;
-            DebugLog("Trading stopped due to 7 consecutive SL hits.", true);
-            return;
-        }
-
-        if (!activeTradeExists) {
-            double rsiValue = 0.0;
-            if (CopyBuffer(rsiHandle, 0, 0, 1, rsiBuffer) > 0) {
-                rsiValue = rsiBuffer[0];
-            }
-
-            if (!firstBuyTradeExecuted && rsiValue < InpRsiBuyThreshold) {
-                ExecuteTrade(true); // Buy Trade on RSI < 35
-                firstBuyTradeExecuted = true;
-            }
-
-            if (!firstSellTradeExecuted && rsiValue > InpRsiSellThreshold) {
-                ExecuteTrade(false); // Sell Trade on RSI > 75
-                firstSellTradeExecuted = true;
-            }
-        }
-
-        CheckPositionStatus();
-    }
-
-    // Initialization of RSI handle
-    void Init() {
-        rsiHandle = iRSI(InpInputSymbol, InpChartTimeframe, InpRsiPeriod, PRICE_CLOSE);
-        if (rsiHandle == INVALID_HANDLE) {
-            DebugLog("Failed to initialize RSI indicator", true);
-        } else {
-            ArraySetAsSeries(rsiBuffer, true); // Ensure the buffer is aligned as a time series
+    // Cleanup Resources
+    void CleanUp() {
+        if (rsiHandle != INVALID_HANDLE) {
+            IndicatorRelease(rsiHandle);
         }
     }
 };
 
-// Create the Strategy Instance
+// Create Strategy Instance
 CRSIBacktestStrategy strategy;
 
+// Initialization Function
 int OnInit() {
-    strategy.Init(); // Initialize strategy
-    DebugLog("Strategy Initialized: " + InpStrategyName, true);
+    if (!strategy.Init()) {
+        return(INIT_FAILED);
+    }
+    DebugLog("Strategy Initialized: EURUSD RSI Martingale", true);
     return(INIT_SUCCEEDED);
 }
 
+// Tick Function
 void OnTick() {
-    strategy.CheckTradeOpportunity();
+    strategy.CheckTradeConditions();
 }
 
+// Deinitialization
 void OnDeinit(const int reason) {
-    strategy.CleanUp(); // Clean up resources
+    strategy.CleanUp();
 }
